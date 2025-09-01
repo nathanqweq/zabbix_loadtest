@@ -135,69 +135,139 @@ func main() {
 	fmt.Scanln(&numItems)
 	fmt.Print("Duração do teste em segundos: ")
 	fmt.Scanln(&testDurationSec)
-
-	// 1. Criar grupo de testes
-	groupParams := map[string]interface{}{
-		"name": "PerformanceTestGroup",
-	}
-	res, err := callZabbixAPI(apiURL, token, "hostgroup.create", groupParams)
-	if err != nil {
-		log.Fatalf("Erro ao criar grupo: %v", err)
-	}
-	var groupResp map[string][]string
-	json.Unmarshal(res, &groupResp)
-	groupID := groupResp["groupids"][0]
-	fmt.Println("Grupo de teste criado, ID:", groupID)
 	
-	// Create a slice to store host names for later use in sending values
+	// 1. Verificar/criar grupo de testes
+	groupName := "PerformanceTestGroup"
+	var groupID string
+	
+	// Tenta obter o grupo existente
+	groupGetParams := map[string]interface{}{
+		"output": "extend",
+		"filter": map[string]string{
+			"name": groupName,
+		},
+	}
+	res, err := callZabbixAPI(apiURL, token, "hostgroup.get", groupGetParams)
+	if err != nil {
+		log.Fatalf("Erro ao buscar grupo: %v", err)
+	}
+	
+	var existingGroups []map[string]interface{}
+	json.Unmarshal(res, &existingGroups)
+	
+	if len(existingGroups) > 0 {
+		groupID = existingGroups[0]["groupid"].(string)
+		fmt.Println("Grupo de teste já existe, ID:", groupID)
+	} else {
+		// Se o grupo não existir, cria um novo
+		groupCreateParams := map[string]interface{}{
+			"name": groupName,
+		}
+		res, err := callZabbixAPI(apiURL, token, "hostgroup.create", groupCreateParams)
+		if err != nil {
+			log.Fatalf("Erro ao criar grupo: %v", err)
+		}
+		var groupCreateResp map[string][]string
+		json.Unmarshal(res, &groupCreateResp)
+		groupID = groupCreateResp["groupids"][0]
+		fmt.Println("Grupo de teste criado, ID:", groupID)
+	}
+	
 	hostNames := make([]string, 0, numHosts)
 
-	// 2. Criar hosts e itens
+	// 2. Verificar/criar hosts e itens
 	for i := 1; i <= numHosts; i++ {
 		hostName := fmt.Sprintf("PerfTestHost-%d", i)
-		hostParams := map[string]interface{}{
-			"host": hostName,
-			"interfaces": []map[string]interface{}{
-				{
-					"type":  1, // Agent
-					"main":  1,
-					"useip": 1,
-					"ip":    serverDNS,
-					"dns":   "",
-					"port":  "10050",
-				},
+		var hostID string
+		
+		// Tenta obter o host existente
+		hostGetParams := map[string]interface{}{
+			"output": "extend",
+			"filter": map[string]string{
+				"host": hostName,
 			},
-			"groups": []map[string]string{{"groupid": groupID}},
 		}
-
-		hRes, err := callZabbixAPI(apiURL, token, "host.create", hostParams)
+		hRes, err := callZabbixAPI(apiURL, token, "host.get", hostGetParams)
 		if err != nil {
-			log.Fatalf("Erro ao criar host %s: %v", hostName, err)
+			log.Fatalf("Erro ao buscar host %s: %v", hostName, err)
 		}
-		var hResp map[string][]string
-		json.Unmarshal(hRes, &hResp)
-		// hostID is not needed here, only hostName for zabbix_sender
-		hostNames = append(hostNames, hostName)
-		fmt.Println("Host criado:", hostName, "ID:", hResp["hostids"][0])
-
-		// Criar itens do tipo trapper para simular dados
-		for j := 1; j <= numItems; j++ {
-			itemParams := map[string]interface{}{
-				"name":       fmt.Sprintf("PerfItem-%d", j),
-				"key_":       fmt.Sprintf("perf.test[%d]", j),
-				"hostid":     hResp["hostids"][0],
-				"type":       2, // Zabbix trapper
-				"value_type": 0, // Numeric float
-				"delay":      "0", // Não há polling, aguarda dados
+		
+		var existingHosts []map[string]interface{}
+		json.Unmarshal(hRes, &existingHosts)
+		
+		if len(existingHosts) > 0 {
+			hostID = existingHosts[0]["hostid"].(string)
+			fmt.Println("Host já existe:", hostName, "ID:", hostID)
+		} else {
+			// Se o host não existir, cria um novo
+			hostCreateParams := map[string]interface{}{
+				"host": hostName,
+				"interfaces": []map[string]interface{}{
+					{
+						"type":  1, // Agent
+						"main":  1,
+						"useip": 1,
+						"ip":    serverDNS,
+						"dns":   "",
+						"port":  "10050",
+					},
+				},
+				"groups": []map[string]string{{"groupid": groupID}},
 			}
-			_, err := callZabbixAPI(apiURL, token, "item.create", itemParams)
+			hRes, err := callZabbixAPI(apiURL, token, "host.create", hostCreateParams)
 			if err != nil {
-				log.Fatalf("Erro ao criar item para host %s: %v", hostName, err)
+				log.Fatalf("Erro ao criar host %s: %v", hostName, err)
+			}
+			var hCreateResp map[string][]string
+			json.Unmarshal(hRes, &hCreateResp)
+			hostID = hCreateResp["hostids"][0]
+			fmt.Println("Host criado:", hostName, "ID:", hostID)
+		}
+		
+		hostNames = append(hostNames, hostName)
+		
+		// 3. Verificar/criar itens do tipo trapper para simular dados
+		for j := 1; j <= numItems; j++ {
+			itemKey := fmt.Sprintf("perf.test[%d]", j)
+			
+			// Tenta obter o item existente
+			itemGetParams := map[string]interface{}{
+				"output": "extend",
+				"hostids": hostID,
+				"search": map[string]string{
+					"key_": itemKey,
+				},
+			}
+			iRes, err := callZabbixAPI(apiURL, token, "item.get", itemGetParams)
+			if err != nil {
+				log.Fatalf("Erro ao buscar item com chave %s: %v", itemKey, err)
+			}
+			
+			var existingItems []map[string]interface{}
+			json.Unmarshal(iRes, &existingItems)
+			
+			if len(existingItems) == 0 {
+				// Se o item não existir, cria um novo
+				itemCreateParams := map[string]interface{}{
+					"name":       fmt.Sprintf("PerfItem-%d", j),
+					"key_":       itemKey,
+					"hostid":     hostID,
+					"type":       2, // Zabbix trapper
+					"value_type": 0, // Numeric float
+					"delay":      "0", // Não há polling, aguarda dados
+				}
+				_, err := callZabbixAPI(apiURL, token, "item.create", itemCreateParams)
+				if err != nil {
+					log.Fatalf("Erro ao criar item para host %s: %v", hostName, err)
+				}
+				fmt.Printf("  Item '%s' criado para o host '%s'\n", itemKey, hostName)
+			} else {
+				fmt.Printf("  Item '%s' já existe para o host '%s'\n", itemKey, hostName)
 			}
 		}
 	}
 	
-	// 3. Enviar valores simultaneamente para cada host usando goroutines.
+	// 4. Enviar valores simultaneamente para cada host usando goroutines.
 	fmt.Println("\nIniciando envio simultâneo de dados com zabbix_sender...")
 	var wg sync.WaitGroup
 	for _, hostName := range hostNames {
