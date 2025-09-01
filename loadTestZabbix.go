@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os/exec"
 	"sync"
 	"time"
 )
@@ -84,13 +85,42 @@ func callZabbixAPI(apiURL, token, method string, params interface{}) (json.RawMe
 	return zResp.Result, nil
 }
 
+// sendValues executa o zabbix_sender para enviar valores a um host durante um tempo determinado.
+func sendValues(serverDNS, hostName string, testDurationSec int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	
+	log.Printf("[INFO] Iniciando envio de valores para o host '%s' por %d segundos...", hostName, testDurationSec)
+	
+	startTime := time.Now()
+	endTime := startTime.Add(time.Duration(testDurationSec) * time.Second)
+	sentValues := 0
+	
+	for time.Now().Before(endTime) {
+		value := fmt.Sprintf("%d", sentValues+1)
+		key := "perf.test[1]"
+		
+		cmd := exec.Command("zabbix_sender", "-z", serverDNS, "-s", hostName, "-k", key, "-o", value)
+		
+		err := cmd.Run()
+		if err != nil {
+			log.Printf("[ERRO] Falha ao enviar valor para '%s': %v", hostName, err)
+		}
+		
+		sentValues++
+		// Pequena pausa para simular a carga distribuída
+		time.Sleep(10 * time.Millisecond)
+	}
+	log.Printf("[INFO] Envio de dados para o host '%s' concluído. Total de valores enviados: %d.", hostName, sentValues)
+}
+
 func main() {
 	var (
-		apiURL    string
-		serverDNS string
-		token     string
-		numHosts  int
-		numItems  int
+		apiURL         string
+		serverDNS      string
+		token          string
+		numHosts       int
+		numItems       int
+		testDurationSec int
 	)
 
 	fmt.Print("URL do Zabbix (ex.: https://127.0.0.1/zabbix/api_jsonrpc.php): ")
@@ -103,6 +133,8 @@ func main() {
 	fmt.Scanln(&numHosts)
 	fmt.Print("Número de itens por host: ")
 	fmt.Scanln(&numItems)
+	fmt.Print("Duração do teste em segundos: ")
+	fmt.Scanln(&testDurationSec)
 
 	// 1. Criar grupo de testes
 	groupParams := map[string]interface{}{
@@ -116,10 +148,11 @@ func main() {
 	json.Unmarshal(res, &groupResp)
 	groupID := groupResp["groupids"][0]
 	fmt.Println("Grupo de teste criado, ID:", groupID)
+	
+	// Create a slice to store host names for later use in sending values
+	hostNames := make([]string, 0, numHosts)
 
 	// 2. Criar hosts e itens
-	var wg sync.WaitGroup
-
 	for i := 1; i <= numHosts; i++ {
 		hostName := fmt.Sprintf("PerfTestHost-%d", i)
 		hostParams := map[string]interface{}{
@@ -143,15 +176,16 @@ func main() {
 		}
 		var hResp map[string][]string
 		json.Unmarshal(hRes, &hResp)
-		hostID := hResp["hostids"][0]
-		fmt.Println("Host criado:", hostName, "ID:", hostID)
+		// hostID is not needed here, only hostName for zabbix_sender
+		hostNames = append(hostNames, hostName)
+		fmt.Println("Host criado:", hostName, "ID:", hResp["hostids"][0])
 
 		// Criar itens do tipo trapper para simular dados
 		for j := 1; j <= numItems; j++ {
 			itemParams := map[string]interface{}{
 				"name":       fmt.Sprintf("PerfItem-%d", j),
 				"key_":       fmt.Sprintf("perf.test[%d]", j),
-				"hostid":     hostID,
+				"hostid":     hResp["hostids"][0],
 				"type":       2, // Zabbix trapper
 				"value_type": 0, // Numeric float
 				"delay":      "0", // Não há polling, aguarda dados
@@ -161,16 +195,16 @@ func main() {
 				log.Fatalf("Erro ao criar item para host %s: %v", hostName, err)
 			}
 		}
-
-		// A seção de subprocessos foi removida, pois não é possível simular
-		// o zabbix_sender a partir deste código Go sem o executável.
-		// A lógica original era apenas um placeholder.
-
-		// Para testar o código, você precisaria executar o zabbix_sender
-		// manualmente, apontando para os hosts e itens criados.
-		// Ex: zabbix_sender -z <serverDNS> -s <hostName> -k <key_> -o <valor>
+	}
+	
+	// 3. Enviar valores simultaneamente para cada host usando goroutines.
+	fmt.Println("\nIniciando envio simultâneo de dados com zabbix_sender...")
+	var wg sync.WaitGroup
+	for _, hostName := range hostNames {
+		wg.Add(1)
+		go sendValues(serverDNS, hostName, testDurationSec, &wg)
 	}
 
 	wg.Wait()
-	fmt.Println("Teste de performance concluído.")
+	fmt.Println("\nTeste de performance concluído.")
 }
